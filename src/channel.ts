@@ -33,6 +33,12 @@ export class Channel extends EventEmitter {
   private topicToTaskId = new Map<string, string>(); // topic -> canonical taskId
   private knownTaskIds = new Set<string>();
   private activityTimers = new Map<string, NodeJS.Timeout>();
+  // Static role maps registered by agents at subscribe time. Post-time role
+  // gating derives from these — never from LLM-authored message content (§8.1 #6).
+  private senderTopics = new Map<string, string[]>(); // agentId -> its role topics
+  // Topic strings a human opened. Human-opened topics are open to every agent
+  // (FR9 / §8.1 #5), so posts on them bypass sender role gating.
+  private humanTopics = new Set<string>();
 
   constructor(
     private name: string = "#general",
@@ -45,6 +51,36 @@ export class Channel extends EventEmitter {
     const topic = opts.topic ?? "general";
     const kind = opts.kind ?? "announce";
     const to = opts.to ?? "channel";
+
+    // A human-opened topic is open to every agent regardless of role (FR9 /
+    // §8.1 #5). Record it before any gating so agent replies to a human-opened
+    // task are never dropped for being outside the replier's role map.
+    if (from === "human") this.humanTopics.add(topic);
+
+    // Post-time role gating (§8.1 #6): routing derives from the sender's static
+    // role map, never from LLM-authored message content. A known agent posting
+    // on a topic outside its own role map is a role-violating contribution —
+    // dropped before it can bind a taskId or be delivered (also blocks the
+    // cross-role re-topic injection of §8.1 #1).
+    if (from !== "human") {
+      const senderTopics = this.senderTopics.get(from);
+      if (
+        senderTopics &&
+        !senderTopics.includes(topic) &&
+        !this.humanTopics.has(topic)
+      ) {
+        return {
+          id: randomUUID(),
+          timestamp: Date.now(),
+          from,
+          content,
+          to,
+          topic,
+          kind,
+          taskId: undefined,
+        };
+      }
+    }
 
     const taskId = this.resolveTaskId(topic, from, opts);
     if (taskId === null) {
@@ -187,8 +223,13 @@ export class Channel extends EventEmitter {
     return this.messages.filter((m) => (m.topic ?? "general") === topic);
   }
 
-  subscribe(agentId: string, callback: (msg: Message) => void): void {
+  subscribe(
+    agentId: string,
+    callback: (msg: Message) => void,
+    topics?: string[]
+  ): void {
     this.subscribers.set(agentId, callback);
+    if (topics) this.senderTopics.set(agentId, topics);
   }
 
   unsubscribe(agentId: string): void {

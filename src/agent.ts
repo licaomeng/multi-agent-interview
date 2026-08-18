@@ -26,11 +26,15 @@ export class Agent {
   }
 
   start(): void {
-    this.channel.subscribe(this.config.id, (msg) => {
-      if (this.shouldIgnore(msg)) return;
-      this.queue.push(msg);
-      this.processQueue();
-    });
+    this.channel.subscribe(
+      this.config.id,
+      (msg) => {
+        if (this.shouldIgnore(msg)) return;
+        this.queue.push(msg);
+        this.processQueue();
+      },
+      this.config.topics
+    );
   }
 
   /**
@@ -43,11 +47,15 @@ export class Agent {
 
     if (msg.kind === "close") return true;
     if (this.channel.isClosed(taskId)) return true;
-    if (msg.to && msg.to !== "channel" && msg.to !== this.config.id) return true;
 
-    // Role gating: agent-authored messages are only processed for topics in
-    // this agent's static role->topic map. Human messages route to everyone.
-    if (msg.from !== "human" && !this.config.topics.includes(topic)) return true;
+    // Human messages route to every agent regardless of role or an explicit
+    // (even bogus) `to` (FR9 / §8.1 #5). Addressing + role gating apply to
+    // agent-authored messages only — routing derives from the sender's static
+    // role, never from LLM-authored content (§8.1 #6).
+    if (msg.from !== "human") {
+      if (msg.to && msg.to !== "channel" && msg.to !== this.config.id) return true;
+      if (!this.config.topics.includes(topic)) return true;
+    }
 
     // Reply budget (counted at post time). The topic owner is exempt so it can
     // always publish the completion summary + close.

@@ -38,14 +38,22 @@ describe("INTEGRATION: multi-agent task completion", () => {
     // Exactly one owner.
     expect(channel.getOwner("general")).toBe("pm");
 
-    // Owner published a final summary (kind answer, non-empty) before closing.
-    const summaries = history.filter(
-      (m) => m.from === "pm" && m.kind === "answer" && m.content.length > 0
-    );
-    expect(summaries.length).toBeGreaterThan(0);
+    // The owner published EXACTLY ONE completion summary, and the close
+    // directly follows it (duplicate-work strictness + FR11). Note: pm also
+    // posts ordinary "answer" replies during the exchange, so the completion
+    // summary is identified as the message immediately before the close.
+    const closeIdx = history.findIndex((m) => m.kind === "close");
+    expect(closeIdx).toBeGreaterThanOrEqual(0);
+    const completionSummary = history[closeIdx - 1];
+    expect(completionSummary).toBeDefined();
+    expect(completionSummary.from).toBe("pm");
+    expect(completionSummary.kind).toBe("answer");
+    expect(completionSummary.content.length).toBeGreaterThan(0);
+    expect(history.filter((m) => m.kind === "close")).toHaveLength(1);
 
-    // Bounded even though the mocked LLM would happily keep replying.
-    expect(history.length).toBeLessThan(30);
+    // Tight bound: 1 human opener + owner's 1 non-final reply + its summary +
+    // close + 2 non-owner agents x 2-reply budget = 8.
+    expect(history.length).toBeLessThanOrEqual(8);
   });
 
   it("human messages route to ALL agents regardless of role", async () => {
@@ -118,7 +126,10 @@ describe("INTEGRATION: multi-agent task completion", () => {
     const history = channel.getHistory("general");
     expect(history.filter((m) => m.kind === "close").length).toBe(1);
     expect(channel.getOwner("general")).toBe(agents[0].id);
-    expect(history.length).toBeLessThan(30);
+    // Tight bound: 1 human opener + owner's summary + close + 4 non-owner
+    // agents x 2-reply budget = 11 (the owner completes on its FIRST call, so
+    // it posts no non-final reply).
+    expect(history.length).toBeLessThanOrEqual(11);
   });
 
   it("LLM error path: ownership is released and the topic can be re-claimed", async () => {

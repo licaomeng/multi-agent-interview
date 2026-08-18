@@ -57,6 +57,17 @@ describe("REGRESSION: anti-replay / loop termination", () => {
 
     await waitFor(() => channel.getReplyCount("general", "pm") === 1);
     await waitFor(() => channel.isClosed("general"), 2000);
+
+    // The watchdog calls close() directly — it does NOT post a close message.
+    const history = channel.getHistory("general");
+    expect(history.filter((m) => m.kind === "close")).toEqual([]);
+
+    // After the force-close, no agent posts a further reply: the count and
+    // history stay exactly where they were when the topic closed.
+    const lenAtClose = history.length;
+    await settle(channel, 60, 1000);
+    expect(channel.getReplyCount("general", "pm")).toBe(1);
+    expect(channel.getHistory("general").length).toBe(lenAtClose);
   });
 });
 
