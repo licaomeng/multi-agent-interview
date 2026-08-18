@@ -94,7 +94,9 @@ export class Agent {
     if (!this.channel.getOwner(taskId) && this.config.topics.includes(topic)) {
       this.channel.claim(taskId, this.config.id);
     }
-    const isOwner = this.channel.getOwner(taskId) === this.config.id;
+    // Whether THIS agent owned the topic when it started processing. Ownership
+    // can change while the LLM call is in flight — see the post-await re-check.
+    const claimedOwnership = this.channel.getOwner(taskId) === this.config.id;
 
     // Per-topic history when available (windowed context).
     const history = this.channel.getHistory(topic);
@@ -112,13 +114,20 @@ export class Agent {
     } catch (err: any) {
       console.error(`[${this.config.id}] LLM error: ${err.message}`);
       // Release ownership so the topic can be re-claimed / force-closed.
-      if (isOwner) this.channel.release(taskId, this.config.id);
+      // release() only clears ownership if this agent still owns the topic, so
+      // it is a safe no-op if ownership was already re-claimed elsewhere.
+      if (claimedOwnership) this.channel.release(taskId, this.config.id);
       return;
     }
 
     // Re-check after the await: a topic may have been closed / ownership may
     // have changed while we were calling the LLM.
     if (this.channel.isClosed(taskId)) return;
+
+    // Stale-ownership guard: the topic may have been released and re-claimed
+    // by another agent while this LLM call was in flight. Only the CURRENT
+    // owner may publish the completion summary + close.
+    const isOwner = this.channel.getOwner(taskId) === this.config.id;
 
     // Owner completion: publish a final summary + a close message. Both are
     // EXEMPT from the reply budget.

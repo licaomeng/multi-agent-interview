@@ -216,6 +216,86 @@ describe("COVERAGE GAPS: design invariants from DESIGN.md §8.1", () => {
     ).toEqual(closeMsgsAtClose);
     expect(channel.getReplyCount("general", "engineer")).toBe(0);
   });
+
+  it("stale-owner race: an owner that loses ownership mid-LLM-call cannot close the topic", async () => {
+    const channel = new Channel();
+    // engineer subscribes first => claims "general"; its LLM call is deferred.
+    const engDeferred = makeDeferredMock();
+    // qa re-claims the topic and is the one who eventually completes it.
+    const qaDeferred = makeDeferredMock();
+    const engineer = makeAgent(engineerConfig, channel, engDeferred.llm);
+    const qa = makeAgent(qaConfig, channel, qaDeferred.llm);
+    engineer.start();
+    qa.start();
+
+    // Human opener: both agents process it (human bypass); engineer claims.
+    channel.post("human", "task", { topic: "general", kind: "question" });
+    await waitFor(() => engDeferred.calls >= 1 && qaDeferred.calls >= 1);
+    expect(channel.getOwner("general")).toBe("engineer");
+
+    // Ownership is released and re-claimed while engineer's call is in flight.
+    expect(channel.release("general", "engineer")).toBe(true);
+    expect(channel.claim("general", "qa")).toBe("qa");
+
+    // The stale owner's call resolves with a completion marker while the topic
+    // is still OPEN. It must NOT publish a summary/close (ownership changed).
+    engDeferred.resolve("[DONE] stale owner summary");
+    await settle(channel);
+
+    expect(channel.isClosed("general")).toBe(false);
+    const engMsgs = channel
+      .getHistory("general")
+      .filter((m) => m.from === "engineer");
+    expect(engMsgs.every((m) => m.kind !== "close")).toBe(true);
+    expect(
+      channel.getHistory("general").some((m) => m.content === "stale owner summary")
+    ).toBe(false);
+
+    // The current owner (qa) completes the topic; exactly one close, from qa.
+    qaDeferred.resolve("[DONE] qa completes");
+    await waitFor(() => channel.isClosed("general"));
+
+    const closeMsgs = channel
+      .getHistory("general")
+      .filter((m) => m.kind === "close");
+    expect(closeMsgs).toHaveLength(1);
+    expect(closeMsgs[0].from).toBe("qa");
+    expect(channel.getOwner("general")).toBe("qa");
+  });
+
+  it("close spoof: a non-owner's close post on an owned topic is dropped", async () => {
+    const channel = new Channel();
+    // qa's role map includes "general", so role gating does NOT drop its post —
+    // only the new close-ownership guard can.
+    channel.subscribe("qa", () => {}, ["general"]);
+    channel.post("human", "start", { topic: "general", kind: "question" });
+    expect(channel.claim("general", "engineer")).toBe("engineer");
+
+    const before = channel.getHistory("general").length;
+    const spoof = channel.post("qa", "I'll close this", {
+      topic: "general",
+      taskId: "general",
+      kind: "close",
+    });
+
+    // Dropped: not stored, no taskId bound, topic not closed.
+    expect(spoof.taskId).toBeUndefined();
+    expect(channel.getHistory("general").length).toBe(before);
+    expect(channel.isClosed("general")).toBe(false);
+
+    // The eventual real close (owner) stays exactly one in history.
+    channel.post("engineer", "[DONE]", {
+      topic: "general",
+      taskId: "general",
+      kind: "close",
+    });
+    channel.close("general");
+    const closeMsgs = channel
+      .getHistory("general")
+      .filter((m) => m.kind === "close");
+    expect(closeMsgs).toHaveLength(1);
+    expect(closeMsgs[0].from).toBe("engineer");
+  });
 });
 
 describe("COVERAGE GAPS: per-task budgets across topics", () => {

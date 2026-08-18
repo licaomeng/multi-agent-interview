@@ -98,6 +98,28 @@ export class Channel extends EventEmitter {
       };
     }
 
+    // Close-signal ownership guard (§8.1 #3/#4): only the CURRENT topic owner
+    // (or a human, FR9/§8.1 #5) may publish a `close` on a topic owned by
+    // someone else. A non-owner spoofing a close is dropped exactly like the
+    // send-side role gate — not stored, not emitted, not delivered — so the
+    // "exactly one close" invariant on raw history holds. (A close on a topic
+    // with no current owner is left to the legacy path.)
+    if (kind === "close" && from !== "human") {
+      const owner = this.getOwner(taskId);
+      if (owner !== null && owner !== from) {
+        return {
+          id: randomUUID(),
+          timestamp: Date.now(),
+          from,
+          content,
+          to,
+          topic,
+          kind,
+          taskId: undefined,
+        };
+      }
+    }
+
     const msg: Message = {
       id: randomUUID(),
       timestamp: Date.now(),
