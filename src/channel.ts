@@ -1,25 +1,93 @@
 import { randomUUID } from "crypto";
 import { EventEmitter } from "events";
-import type { Message } from "./types.js";
+import type { Message, MessageKind } from "./types.js";
 
+export interface PostOptions {
+  to?: string | "channel";
+  topic?: string;
+  kind?: MessageKind;
+  // A taskId minted by the Channel. Non-owner agents may NOT mint new ones.
+  taskId?: string;
+  // When true, this post increments the sender's reply ledger for the task.
+  // Exempt messages (owner summary, close) omit it.
+  countReply?: boolean;
+}
+
+/**
+ * The coordination kernel for the multi-agent system.
+ *
+ * Still an EventEmitter, still no central coordinator agent — the Channel
+ * only holds the shared facts (topics/ownership/closed-set/reply ledger) that
+ * distributed routing decisions consult. All shared-state access is
+ * synchronous, so first-come-first-wins claim is race-free.
+ */
 export class Channel extends EventEmitter {
   private messages: Message[] = [];
   private subscribers = new Map<string, (msg: Message) => void>();
   private memberNames = new Map<string, string>();
 
-  constructor(private name: string = "#general") {
+  // Coordination state.
+  private owners = new Map<string, string>(); // taskId -> owner agentId
+  private closed = new Set<string>(); // closed taskIds
+  private replyLedger = new Map<string, number>(); // "taskId::agentId" -> count
+  private topicToTaskId = new Map<string, string>(); // topic -> canonical taskId
+  private knownTaskIds = new Set<string>();
+  private activityTimers = new Map<string, NodeJS.Timeout>();
+
+  constructor(
+    private name: string = "#general",
+    private stallTimeoutMs: number = 0
+  ) {
     super();
   }
 
-  post(from: string, content: string): Message {
+  post(from: string, content: string, opts: PostOptions = {}): Message {
+    const topic = opts.topic ?? "general";
+    const kind = opts.kind ?? "announce";
+    const to = opts.to ?? "channel";
+
+    const taskId = this.resolveTaskId(topic, from, opts);
+    if (taskId === null) {
+      // A non-owner agent attempted to open a brand-new topic/taskId.
+      // Rejected: not stored, not emitted, no ledger increment.
+      return {
+        id: randomUUID(),
+        timestamp: Date.now(),
+        from,
+        content,
+        to,
+        topic,
+        kind,
+        taskId: undefined,
+      };
+    }
+
     const msg: Message = {
       id: randomUUID(),
       timestamp: Date.now(),
       from,
       content,
+      to,
+      topic,
+      kind,
+      taskId,
     };
+
+    // Post-time guard: a reply that arrives after its topic closed is dropped
+    // (kind "close" itself always passes, so a close signal is never lost).
+    if (this.closed.has(taskId) && kind !== "close") {
+      return msg;
+    }
+
+    // Reply budget is counted at POST time (regression for the sender-exclusion
+    // bug: the poster's own post always increments its own ledger entry).
+    if (opts.countReply) {
+      this.incrementReplies(taskId, from);
+    }
+
     this.messages.push(msg);
     this.emit("message", msg);
+    this.touch(taskId);
 
     for (const [agentId, callback] of this.subscribers) {
       if (agentId !== from) {
@@ -28,6 +96,95 @@ export class Channel extends EventEmitter {
     }
 
     return msg;
+  }
+
+  /**
+   * Resolve (and mint when allowed) the canonical taskId for a post.
+   * - Known topic -> its existing taskId.
+   * - Agent re-topic attempt with a KNOWN taskId -> binds the renamed topic to
+   *   the existing taskId (no fresh budget / ownership).
+   * - "human" may open a brand-new topic/task.
+   * - Any other agent attempting a new topic -> null (rejected).
+   */
+  private resolveTaskId(
+    topic: string,
+    from: string,
+    opts: PostOptions
+  ): string | null {
+    const known = this.topicToTaskId.get(topic);
+    if (known) return known;
+
+    if (opts.taskId && this.knownTaskIds.has(opts.taskId)) {
+      this.topicToTaskId.set(topic, opts.taskId);
+      return opts.taskId;
+    }
+
+    if (from === "human") {
+      this.knownTaskIds.add(topic);
+      this.topicToTaskId.set(topic, topic);
+      return topic;
+    }
+
+    return null;
+  }
+
+  /**
+   * Atomically claim a topic. First caller wins; returns the ownerId.
+   * Closed topics cannot be claimed.
+   */
+  claim(taskId: string, agentId: string): string | null {
+    if (this.closed.has(taskId)) return null;
+    const existing = this.owners.get(taskId);
+    if (existing !== undefined) return existing;
+    this.owners.set(taskId, agentId);
+    return agentId;
+  }
+
+  getOwner(taskId: string): string | null {
+    return this.owners.get(taskId) ?? null;
+  }
+
+  /** Release ownership (e.g. on agent failure) so the topic can be re-claimed. */
+  release(taskId: string, agentId: string): boolean {
+    if (this.owners.get(taskId) === agentId) {
+      this.owners.delete(taskId);
+      return true;
+    }
+    return false;
+  }
+
+  /** Close a topic. Idempotent. Returns true if this call closed it. */
+  close(taskId: string): boolean {
+    const timer = this.activityTimers.get(taskId);
+    if (timer) {
+      clearTimeout(timer);
+      this.activityTimers.delete(taskId);
+    }
+    if (this.closed.has(taskId)) return false;
+    this.closed.add(taskId);
+    return true;
+  }
+
+  isClosed(taskId: string): boolean {
+    return this.closed.has(taskId);
+  }
+
+  /** Reply-ledger increment API, keyed by (taskId, agentId). */
+  incrementReplies(taskId: string, agentId: string): number {
+    const key = `${taskId}::${agentId}`;
+    const n = (this.replyLedger.get(key) ?? 0) + 1;
+    this.replyLedger.set(key, n);
+    return n;
+  }
+
+  getReplyCount(taskId: string, agentId: string): number {
+    return this.replyLedger.get(`${taskId}::${agentId}`) ?? 0;
+  }
+
+  /** Full history, or a per-topic view when a topic is given. */
+  getHistory(topic?: string): Message[] {
+    if (topic === undefined) return [...this.messages];
+    return this.messages.filter((m) => (m.topic ?? "general") === topic);
   }
 
   subscribe(agentId: string, callback: (msg: Message) => void): void {
@@ -47,15 +204,24 @@ export class Channel extends EventEmitter {
     return this.memberNames.get(id) ?? id;
   }
 
-  getHistory(): Message[] {
-    return [...this.messages];
-  }
-
   getMembers(): string[] {
     return [...this.memberNames.keys()];
   }
 
   getName(): string {
     return this.name;
+  }
+
+  /** Stall watchdog: force-close a still-open topic after inactivity. */
+  private touch(taskId: string): void {
+    if (!this.stallTimeoutMs) return;
+    const existing = this.activityTimers.get(taskId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.activityTimers.delete(taskId);
+      if (!this.closed.has(taskId)) this.close(taskId);
+    }, this.stallTimeoutMs);
+    timer.unref?.();
+    this.activityTimers.set(taskId, timer);
   }
 }

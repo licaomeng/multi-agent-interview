@@ -1,6 +1,14 @@
 import type { AgentConfig, Message } from "./types.js";
 import type { Channel } from "./channel.js";
-import type { LLMClient } from "./llm.js";
+import type { LLM } from "./llm.js";
+
+export interface AgentOptions {
+  replyBudget?: number;
+  completeMarker?: string;
+}
+
+const DEFAULT_REPLY_BUDGET = 2;
+const DEFAULT_COMPLETE_MARKER = "[DONE]";
 
 export class Agent {
   private processing = false;
@@ -9,51 +17,138 @@ export class Agent {
   constructor(
     private config: AgentConfig,
     private channel: Channel,
-    private llm: LLMClient
+    private llm: LLM,
+    private opts: AgentOptions = {}
   ) {}
+
+  get id(): string {
+    return this.config.id;
+  }
 
   start(): void {
     this.channel.subscribe(this.config.id, (msg) => {
+      if (this.shouldIgnore(msg)) return;
       this.queue.push(msg);
       this.processQueue();
     });
   }
 
+  /**
+   * Routing filter, applied BEFORE the message is queued. All coordination
+   * state is read from the Channel, never from a local cache.
+   */
+  private shouldIgnore(msg: Message): boolean {
+    const topic = msg.topic ?? "general";
+    const taskId = msg.taskId ?? topic;
+
+    if (msg.kind === "close") return true;
+    if (this.channel.isClosed(taskId)) return true;
+    if (msg.to && msg.to !== "channel" && msg.to !== this.config.id) return true;
+
+    // Role gating: agent-authored messages are only processed for topics in
+    // this agent's static role->topic map. Human messages route to everyone.
+    if (msg.from !== "human" && !this.config.topics.includes(topic)) return true;
+
+    // Reply budget (counted at post time). The topic owner is exempt so it can
+    // always publish the completion summary + close.
+    const isOwner = this.channel.getOwner(taskId) === this.config.id;
+    const budget = this.opts.replyBudget ?? DEFAULT_REPLY_BUDGET;
+    if (!isOwner && this.channel.getReplyCount(taskId, this.config.id) >= budget) {
+      return true;
+    }
+
+    return false;
+  }
+
   private async processQueue(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
-
-    while (this.queue.length > 0) {
-      const msg = this.queue.shift()!;
-      await this.onMessage(msg);
+    try {
+      while (this.queue.length > 0) {
+        const msg = this.queue.shift()!;
+        try {
+          await this.onMessage(msg);
+        } catch (err: any) {
+          console.error(`[${this.config.id}] onMessage error: ${err.message}`);
+        }
+      }
+    } finally {
+      this.processing = false;
     }
-
-    this.processing = false;
   }
 
   private async onMessage(msg: Message): Promise<void> {
-    const history = this.channel.getHistory();
+    const topic = msg.topic ?? "general";
+    const taskId = msg.taskId ?? topic;
 
+    // Topic ownership: claim synchronously (before the first await). First
+    // agent whose role matches the topic wins; non-owners may NOT open topics.
+    if (!this.channel.getOwner(taskId) && this.config.topics.includes(topic)) {
+      this.channel.claim(taskId, this.config.id);
+    }
+    const isOwner = this.channel.getOwner(taskId) === this.config.id;
+
+    // Per-topic history when available (windowed context).
+    const history = this.channel.getHistory(topic);
     const conversationMessages = history.map((m) => ({
       role: (m.from === this.config.id ? "assistant" : "user") as
         | "user"
         | "assistant",
       content: `[${m.from}]: ${m.content}`,
     }));
-
-    // Merge consecutive same-role messages to satisfy API constraints
     const merged = mergeConsecutiveRoles(conversationMessages);
 
+    let response: string;
     try {
-      const response = await this.llm.chat(this.config.systemPrompt, merged);
-      this.channel.post(this.config.id, response);
+      response = await this.llm.chat(this.config.systemPrompt, merged);
     } catch (err: any) {
       console.error(`[${this.config.id}] LLM error: ${err.message}`);
+      // Release ownership so the topic can be re-claimed / force-closed.
+      if (isOwner) this.channel.release(taskId, this.config.id);
+      return;
     }
+
+    // Re-check after the await: a topic may have been closed / ownership may
+    // have changed while we were calling the LLM.
+    if (this.channel.isClosed(taskId)) return;
+
+    // Owner completion: publish a final summary + a close message. Both are
+    // EXEMPT from the reply budget.
+    const marker = this.opts.completeMarker ?? DEFAULT_COMPLETE_MARKER;
+    if (isOwner && response.includes(marker)) {
+      const summary = response.replace(marker, "").trim();
+      this.channel.post(this.config.id, summary, {
+        to: "channel",
+        topic,
+        taskId,
+        kind: "answer",
+      });
+      this.channel.post(this.config.id, marker, {
+        to: "channel",
+        topic,
+        taskId,
+        kind: "close",
+      });
+      this.channel.close(taskId);
+      return;
+    }
+
+    // Normal reply, subject to the per-task reply budget.
+    const budget = this.opts.replyBudget ?? DEFAULT_REPLY_BUDGET;
+    if (this.channel.getReplyCount(taskId, this.config.id) >= budget) return;
+
+    const kind = msg.kind === "question" ? "answer" : "review";
+    this.channel.post(this.config.id, response, {
+      to: "channel",
+      topic,
+      taskId,
+      kind,
+      countReply: true,
+    });
   }
 }
 
-function mergeConsecutiveRoles(
+export function mergeConsecutiveRoles(
   messages: { role: "user" | "assistant"; content: string }[]
 ): { role: "user" | "assistant"; content: string }[] {
   if (messages.length === 0) return [];

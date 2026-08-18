@@ -66,12 +66,25 @@ type LogEntry =
   | { type: "join"; name: string; color: Color };
 
 export function App({ channel }: { channel: Channel }) {
-  const [log, setLog] = useState<LogEntry[]>([
+  // Seed colors and join entries from members that joined BEFORE render
+  // (fixes the pre-render join color bug — previously fell back to cyan).
+  const [colorMap] = useState(() => {
+    const m = new Map<string, Color>();
+    channel.getMembers().forEach((id, i) => {
+      m.set(id, AGENT_COLORS[i % AGENT_COLORS.length]);
+    });
+    return m;
+  });
+  const [log, setLog] = useState<LogEntry[]>(() => [
     { type: "header", channelName: channel.getName() },
+    ...channel.getMembers().map((id) => ({
+      type: "join" as const,
+      name: channel.getDisplayName(id),
+      color: colorMap.get(id) ?? "cyan",
+    })),
   ]);
   const [input, setInput] = useState("");
-  const [colorMap] = useState(() => new Map<string, Color>());
-  const [colorIndex, setColorIndex] = useState(0);
+  const [colorIndex, setColorIndex] = useState(colorMap.size);
 
   function assignColor(agentId: string): Color {
     if (!colorMap.has(agentId)) {
@@ -103,7 +116,13 @@ export function App({ channel }: { channel: Channel }) {
   const handleSubmit = (value: string) => {
     const trimmed = value.trim();
     if (trimmed) {
-      channel.post("human", trimmed);
+      // Human messages route to ALL agents regardless of role; default topic
+      // "general" (also covered by post() defaults).
+      channel.post("human", trimmed, {
+        to: "channel",
+        topic: "general",
+        kind: "question",
+      });
     }
     setInput("");
   };
